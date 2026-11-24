@@ -93,3 +93,25 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.1
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+
+  oauth:
+    build: ./services
+    command: uvicorn oauth:app --host 0.0.0.0 --port 8000
+    depends_on:
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+volumes:
+  keycloak_data:

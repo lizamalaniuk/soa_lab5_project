@@ -1,13 +1,21 @@
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from common import db, INSTANCE
 import requests
 import json
 import uuid
 from datetime import datetime, timezone
+from fastapi.middleware.cors import CORSMiddleware
+from auth import verify_token, require_scope
 
 app = FastAPI(title="Homework Service")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://cad.kpi.ua"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 
 class HomeworkIn(BaseModel):
@@ -59,7 +67,10 @@ def health():
 
 
 @app.post("/homeworks", status_code=201)
-def create_homework(item: HomeworkIn):
+def create_homework(
+    item: HomeworkIn,
+    token: dict = Depends(verify_token)
+):
     try:
         response = requests.get(
             f"http://users:8000/users/{item.user_id}",
@@ -97,7 +108,9 @@ def create_homework(item: HomeworkIn):
 
 
 @app.get("/homeworks")
-def list_homeworks():
+def list_homeworks(
+    token: dict = Depends(require_scope("homework:read"))
+):
     r = db()
     keys = r.keys("homework:*")
 
@@ -112,7 +125,10 @@ def list_homeworks():
 
 
 @app.get("/homeworks/{task_id}")
-def get_homework(task_id: str):
+def get_homework(
+    task_id: str,
+    token: dict = Depends(require_scope("homework:read"))
+):
     raw = db().get("homework:" + task_id)
 
     if not raw:
@@ -125,7 +141,10 @@ def get_homework(task_id: str):
 
 
 @app.patch("/homeworks/{task_id}/complete")
-def complete_homework(task_id: str):
+def complete_homework(
+    task_id: str,
+    token: dict = Depends(verify_token)
+):
     r = db()
     raw = r.get("homework:" + task_id)
 

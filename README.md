@@ -1,184 +1,185 @@
-# ЛР4 SOA — інтеграція сервісних API з AI-агентами
+# Лабораторна робота №5 — Безпека сервісних API
 
-**Тема:** Function Calling, Model Context Protocol (MCP), Agent-to-Agent (A2A).  
-**Основа проєкту:** мікросервісна система керування домашніми завданнями з ЛР3 (REST API, Redis, RabbitMQ, Transactional Outbox/Inbox, SAGA).
+**Дисципліна:** Інформаційні системи на основі сервісів (ІСОС)  
+**Тема:** Автентифікація, авторизація та обмеження доступу в мікросервісній системі  
+**Проєкт:** Система керування домашніми завданнями (`soa_lab5_project`)
 
-## Мета роботи
+## Мета
 
-Надати локальній LLM доступ до REST API через Function Calling, реалізувати MCP-сервер з інструментами для читання даних та організувати взаємодію Producer Agent і Consumer Agent через A2A. Перевірити обмеження викликів, валідацію аргументів і захист від недовірених даних.
+Розширити створену в попередніх лабораторних роботах мікросервісну систему механізмами безпеки: налаштувати CORS через API Gateway, реалізувати OAuth 2.0 Authorization Code Flow з PKCE за допомогою Keycloak, перевірку JWT, розмежування доступу за OAuth Scopes та вхід через зовнішнього провайдера Google.
 
-## 1. Структура
+## Архітектура
+
+Система складається з кількох компонентів:
+
+| Компонент | Призначення |
+|---|---|
+| **Nginx API Gateway** | Єдина точка входу; маршрутизація запитів до мікросервісів |
+| **User Service (FastAPI)** | Операції з користувачами; захист створення користувача |
+| **Homework Service (FastAPI)** | Операції з домашніми завданнями; перевірка JWT та дозволів |
+| **Notification Service (FastAPI)** | Отримання сповіщень |
+| **OAuth Service (FastAPI)** | Вхід через Keycloak, обмін authorization code на токени, серверна сесія |
+| **Keycloak** | Сервер автентифікації, OAuth 2.0 / OpenID Connect, випуск JWT, брокеризація входу через Google |
+| **Redis** | Дані застосунку та короткоживучі OAuth-сесії |
+| **RabbitMQ** | Асинхронний обмін повідомленнями |
+| **Consumer / Outbox Publisher** | Обробка подій і публікація записів Transactional Outbox |
+| **Saga Coordinator / Saga Timeout** | Координація і контроль часу тривалих процесів |
+| **A2A Producer** | Компонент агентної взаємодії, доданий у попередній лабораторній |
+
+У репозиторії також зберігаються каталоги `a2a_agents`, `ai_agent` і `mcp_server` з напрацюваннями попередніх лабораторних робіт.
+
+### Схема авторизації
 
 ```text
-soa_lab4_project/
-├── ai_agent/
-│   ├── __init__.py
-│   ├── api_client.py       # REST-клієнт до Nginx API Gateway
-│   ├── tools.py            # Python-інструменти для REST API
-│   ├── agent.py            # LLM + Function Calling + guardrails
-│   └── test_injection.py   # тест недовіреного опису завдання
-├── mcp_server/
-│   ├── __init__.py
-│   └── server.py           # MCP-сервер (stdio)
+Браузер → Nginx (/oauth/login) → OAuth Service
+                              ↓
+                        Keycloak (OAuth 2.0 / OIDC)
+                              ↔ Google (зовнішній Identity Provider)
+                              ↓
+                   Authorization Code + PKCE
+                              ↓
+                       OAuth Service → Redis (сесія)
+                              ↓
+                    JWT → User / Homework Service
+                              ↓
+                 Перевірка підпису, issuer, audience,
+                         строку дії та scopes
+```
+
+## Реалізовані механізми безпеки
+
+### 1. CORS
+
+У трьох FastAPI-сервісах налаштовано `CORSMiddleware` з дозволеним джерелом `https://cad.kpi.ua`. Перевірено preflight-запити `OPTIONS` через Nginx: для User, Homework та Notification Service отримано `HTTP 200` і заголовок `Access-Control-Allow-Origin: https://cad.kpi.ua`.
+
+### 2. OAuth 2.0 Authorization Code Flow + PKCE
+
+У Keycloak створено realm `homework-realm` і клієнт `homework-client`. Використовується **Standard Flow** із **PKCE S256**. OAuth Service створює параметри `state` і `code_verifier`, перенаправляє користувача до Keycloak та обмінює одноразовий код на токени. Access token зберігається в короткоживучій серверній сесії Redis; браузер отримує лише `HttpOnly` session cookie.
+
+### 3. Захист JWT
+
+Спільний модуль `services/auth.py` перевіряє JWT за публічними ключами Keycloak (JWKS), підписом, строком дії, `issuer` та `audience=homework-api`.
+
+- Без токена захищений API повертає **401 Unauthorized**.
+- Із дійсним JWT, але без потрібного дозволу, — **403 Forbidden**.
+- Із дійсним JWT та потрібним дозволом — успішну відповідь.
+
+### 4. OAuth Scopes
+
+Для клієнта налаштовано *optional* scopes:
+
+| Scope | Призначення | Приклад захищеної операції |
+|---|---|---|
+| `homework:read` | Читання домашніх завдань | `GET /api/homeworks` |
+| `users:write` | Створення користувачів | `POST /api/users` |
+
+OAuth Service підтримує параметр `scope_type`: `basic`, `homework`, `users`. Права перевіряються за полем `scope` у JWT, а не лише за наявністю авторизованого користувача.
+
+### 5. Google Identity Provider
+
+До Keycloak у realm `homework-realm` додано Google як зовнішнього провайдера. Google OAuth-клієнт створюється окремо в Google Auth Platform, а його Redirect URI має вигляд:
+
+```text
+http://localhost:8081/realms/homework-realm/broker/google/endpoint
+```
+
+Google OAuth Client ID і Client Secret вводяться **в адміністративній панелі Keycloak**; їх **не потрібно записувати в README, комітити до Git або надсилати іншим особам**. Для тестового режиму Google застосунок дозволяє вхід обліковим записам зі списку Test users.
+
+## Структура проєкту
+
+```text
+soa_lab5_project/
 ├── a2a_agents/
-│   ├── __init__.py
-│   ├── producer_agent.py   # A2A Producer, порт 9001 у Docker
-│   ├── consumer_agent.py   # тестовий A2A-клієнт Producer
-│   ├── consumer_server.py  # A2A Consumer, порт 9002 локально
-│   └── test_consumer.py    # наскрізний A2A-тест
+├── ai_agent/
+├── mcp_server/
 ├── nginx/
-├── services/              # мікросервіси, Publisher, Consumer, SAGA з ЛР3
-├── Dockerfile.a2a
+│   └── default.conf
+├── services/
+│   ├── auth.py
+│   ├── oauth.py
+│   ├── users.py
+│   ├── homework.py
+│   ├── notifications.py
+│   ├── consumer.py
+│   └── ...
 ├── docker-compose.yml
+├── Dockerfile.a2a
+├── .gitignore
 └── README.md
 ```
 
-## 2. Архітектура
+## Запуск
 
-- **REST API ЛР3:** Users, Homework і Notifications працюють через Nginx API Gateway. Дані та Outbox зберігаються в Redis; Outbox Publisher публікує події в RabbitMQ. Компоненти SAGA та звичайний RabbitMQ Consumer залишилися з попередньої лабораторної.
-- **Function Calling:** локальна модель `llama3.1:8b` через Ollama вибирає інструменти Python, а програма перевіряє параметри і виконує HTTP-запити через Gateway.
-- **MCP:** окремий stdio-сервер надає інструменти `list_homeworks`, `get_homework`, `get_user`; їх перевірено в MCP Inspector.
-- **A2A:** клієнт звертається до Consumer Agent (`9002`), Consumer через JSON-RPC звертається до Producer Agent (`9001`), Producer записує тестову подію `a2a.ping` у Redis Outbox. Outbox Publisher надсилає її до RabbitMQ.
+**Передумови:** Docker Desktop із Docker Compose, вільні локальні порти `8080`, `8081`, `9001`, `15672`.
 
-## 3. Вимоги
-
-- Windows, Git Bash або термінал VS Code, Python із встановленими залежностями, Docker Desktop.
-- Node.js та `npx` — для MCP Inspector.
-- Ollama з моделлю `llama3.1:8b` — для Function Calling.
-- Python-залежності: `requests`, `ollama`, сумісний з кодом **MCP SDK 1.x** (`mcp[cli]<2`), `a2a-sdk>=1,<2`, `httpx`, `uvicorn`, `starlette`. Для контейнера Producer залежності задаються у `Dockerfile.a2a`.
-
-Приклад локального встановлення:
+У корені проєкту:
 
 ```bash
-python -m pip install requests ollama "mcp[cli]<2" "a2a-sdk>=1,<2" httpx uvicorn starlette
-ollama pull llama3.1:8b
-```
-
-## 4. Запуск мікросервісів
-
-Запуск з кореня проєкту:
-
-```bash
+docker compose config --quiet
 docker compose up -d --build
 docker compose ps
-curl -i http://localhost:8080/health
 ```
 
-Типові локальні адреси:
+Основні локальні адреси:
 
-| Компонент | Адреса |
+| Сервіс | Адреса |
 |---|---|
-| Nginx API Gateway | `http://localhost:8080` |
-| REST API (через Gateway) | `http://localhost:8080/api` |
+| API Gateway | `http://localhost:8080` |
+| Keycloak Admin Console | `http://localhost:8081/admin/` |
+| Початок OAuth-входу | `http://localhost:8080/oauth/login` |
+| Перевірка OAuth-сесії | `http://localhost:8080/oauth/status` |
 | RabbitMQ Management | `http://localhost:15672` |
-| Producer Agent Card | `http://127.0.0.1:9001/.well-known/agent-card.json` |
-| Consumer Agent Card | `http://127.0.0.1:9002/.well-known/agent-card.json` (після локального запуску Consumer) |
 
+У **першому** запуску потрібно вручну створити Keycloak realm `homework-realm`, клієнт `homework-client` (Standard Flow, PKCE S256), audience mapper `homework-api`, optional client scopes `homework:read` і `users:write`. Для Google входу додатково налаштувати Google OAuth Client і Google Identity Provider у Keycloak. Дані Keycloak зберігаються в Docker volume `keycloak_data`, тому після звичайного перезапуску повторювати налаштування не потрібно.
 
-## 5. Завдання 1 — Function Calling
+### Перевірка OAuth
 
-`ai_agent/agent.py` використовує `llama3.1:8b` для вибору інструментів. Для читання доступні `list_homeworks`, `get_homework`, `get_user`. API-клієнт звертається до `http://localhost:8080/api` (або значення змінної середовища `API_BASE_URL`).
+У браузері відкрий:
 
-Запуск:
+- `http://localhost:8080/oauth/login?scope_type=basic` — вхід без додаткових scopes.
+- `http://localhost:8080/oauth/login?scope_type=homework` — запит `homework:read`.
+- `http://localhost:8080/oauth/login?scope_type=users` — запит `users:write`.
+- `http://localhost:8080/oauth/status` — перевірка поточної серверної сесії.
 
-```bash
-python -m ai_agent.agent
-```
+> Маршрути `/oauth/debug-scopes`, `/oauth/test-jwt` та `/oauth/test-homework-jwt` використовувалися лише під час розроблення і видалені з фінальної конфігурації.
 
-**Приклад перевірочного запиту:**
-
-> Знайди завдання з математики, отримай інформацію про його користувача через get_user та повідом точний статус завдання.
-
-Під час перевірки зафіксовано послідовний виклик `list_homeworks` → `get_user` з реальним `user_id`, а також коректне відображення `cancelled` як «скасовано».
-
-**Guardrails:** обмеження числа кроків, викликів інструментів і обліку токенів; перевірка UUID та переліку дозволених інструментів; лише читання через запропоновані LLM інструменти; виключення вільних описів завдань із контексту в цьому сценарії.
-
-Окремий тест недовіреного вмісту без зміни реальних записів Redis:
+### Перевірка CORS
 
 ```bash
-python -m ai_agent.test_injection
+curl -i -X OPTIONS http://localhost:8080/api/users \
+  -H 'Origin: https://cad.kpi.ua' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: Content-Type'
 ```
 
-Тест підтвердив, що інструкція `delete_all_homeworks` з підставленого опису не виконувалася, а статус `cancelled` був відображений правильно. Це тест конкретного сценарію, **не гарантія абсолютного захисту від prompt injection**. Ліміт токенів обчислюється за метриками, поверненими Ollama, і не є жорстким передбаченням витрат до кожного запиту.
+Очікується статус `200 OK` та заголовок `access-control-allow-origin: https://cad.kpi.ua`.
 
-## 6. Завдання 2 — MCP
-
-MCP-сервер надає три інструменти для читання REST API. Використовується транспорт **stdio**.
+### Перевірка доступу без JWT
 
 ```bash
-python -m mcp_server.server
+curl -i http://localhost:8080/api/homeworks
 ```
 
-Для інтерактивної перевірки через MCP Inspector (потрібен Node.js):
+Очікується `401 Unauthorized`.
 
-```bash
-npx @modelcontextprotocol/inspector python -m mcp_server.server
-```
+## Результати проведених перевірок
 
-У браузері відкрийте адресу Inspector, надруковану в терміналі, з наданим токеном; не публікуйте токен. Виберіть **Tools → List Tools**, викличте `list_homeworks`, `get_user` або `get_homework`.
-
-Перевірено успішне отримання списку, користувача та конкретного завдання. Також перевірено відхилення `not-a-valid-uuid` з повідомленням `Invalid UUID`. MCP-сервер обмежує список до 20 елементів та вилучає `description` із результатів. Сервер навчальний, без окремої авторизації клієнтів.
-
-## 7. Завдання 3 — A2A
-
-### Producer Agent
-
-`a2a_agents/producer_agent.py` — A2A-сервер з Agent Card, skill `producer_messaging`, JSON-RPC endpoint та задачами (tasks). Producer запускається в Docker на порту `9001`.
-
-```bash
-docker compose up -d --build a2a_producer
-curl -i http://127.0.0.1:9001/.well-known/agent-card.json
-```
-
-A2A-команда `Опублікуй тестову подію a2a.ping` створює запис `outbox:<event_id>` зі статусом `pending`. Наявний Outbox Publisher передає його до RabbitMQ і після підтвердження змінює статус на `published`.
-
-### Consumer Agent
-
-`a2a_agents/consumer_server.py` — **окремий A2A-сервер** з Agent Card і навичкою `request_producer_publication`. Він працює локально на порту `9002`, отримує A2A-запит і через A2A звертається до Producer. Це не той самий процес, що RabbitMQ Consumer із `services/consumer.py`.
-
-Запуск у другому терміналі (Producer має працювати в Docker):
-
-```bash
-python -m a2a_agents.consumer_server
-```
-
-У третьому терміналі:
-
-```bash
-curl -i http://127.0.0.1:9002/.well-known/agent-card.json
-python -m a2a_agents.test_consumer
-```
-
-Для окремої перевірки прямого клієнта Producer:
-
-```bash
-python -m a2a_agents.consumer_agent
-```
-
-### Перевірка публікації
-
-Збережіть `Event ID`, який поверне A2A-тест, та виконайте:
-
-```bash
-docker compose logs --tail=30 outbox_publisher
-docker compose exec redis redis-cli GET "outbox:EVENT_ID"
-```
-
-У перевіреному запуску журнал містив `OUTBOX PUBLISHED` для створеного Event ID, а запис Redis мав `"type": "a2a.ping"` та `"status": "published"`.
-
-
-## 8. Результати
-
-| Компонент | Що перевірено |
+| Сценарій | Фактичний результат |
 |---|---|
-| Function Calling | Виклик REST-інструментів LLM, послідовність `list_homeworks` → `get_user`, точність статусу |
-| AI guardrails | Блокування невідомого інструмента, перевірка UUID, тест недовіреного опису |
-| MCP | Підключення Inspector, успішні виклики трьох tools, помилка `Invalid UUID` |
-| A2A Producer | Agent Card, JSON-RPC, створення A2A task і запису в Redis Outbox |
-| A2A Consumer | Власна Agent Card, звернення через A2A до Producer і повернення результату |
-| Outbox / RabbitMQ | Відповідний `OUTBOX PUBLISHED` та запис Redis зі статусом `published` |
+| CORS preflight через Nginx до трьох сервісів | `200 OK`, правильний `Access-Control-Allow-Origin` |
+| OAuth 2.0 Authorization Code Flow з PKCE | Успішний вхід; `authenticated: true`, `token_present: true` |
+| User Service без токена | `401 Unauthorized` |
+| User Service з JWT і `users:write` | `201 Created` |
+| Homework Service без токена | `401 Unauthorized` |
+| Homework Service з JWT без `homework:read` | `403 Forbidden` |
+| Homework Service з JWT і `homework:read` | `200 OK` |
+| Вхід через Google → Keycloak → OAuth Service | Успішна авторизація та доступ до Homework Service (`200 OK`) |
+| Видалений діагностичний маршрут `/oauth/debug-scopes` | `404 Not Found` |
 
+## Зауваження щодо безпеки
+
+Проєкт використовується **лише локально для навчання**. У режимі розробки використано HTTP і Keycloak `start-dev`; це не конфігурація для публічного розгортання. Для реального середовища потрібні HTTPS, захищені cookies (`Secure`), надійні паролі, керування секретами та додаткове посилення контролю доступу. Не публікуйте Google Client Secret, токени, вміст Redis або облікові дані адміністратора. Якщо секрет було розкрито, його необхідно відкликати та випустити новий.
 
 ## Висновок
 
-У лабораторній роботі №4 розширено систему мікросервісів з попередньої лабораторної засобами інтеграції з AI-агентами. Реалізовано Function Calling для локальної LLM, MCP-сервер для REST API та взаємодію двох A2A-агентів із використанням Redis Outbox і RabbitMQ. Перевірено основні запити, обмеження інструментів і публікацію тестових подій; окремо визначено межі продемонстрованої реалізації.
+У лабораторній роботі реалізовано та перевірено базові механізми захисту сервісних API: CORS, OAuth 2.0 Authorization Code Flow із PKCE, JWT, розмежування доступу за scopes та федеративний вхід через Google. Результати HTTP-перевірок підтвердили різницю між відсутністю автентифікації (`401`), відсутністю потрібних прав (`403`) та дозволеним доступом (`200` / `201`).
